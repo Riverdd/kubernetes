@@ -122,6 +122,8 @@ type Runtime interface {
 	// CheckpointContainer tells the runtime to checkpoint a container
 	// and store the resulting archive to the checkpoint directory.
 	CheckpointContainer(options *runtimeapi.CheckpointContainerRequest) error
+	// GetSandboxIDByPodUID return a string list of sandbox IDs of the pod.
+	GetSandboxIDByPodUID(podName string, podNamespace string, podUID types.UID) ([]string, error)
 }
 
 // StreamingRuntime is the interface implemented by runtimes that handle the serving of the

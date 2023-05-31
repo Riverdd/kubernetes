@@ -383,3 +383,14 @@ func (m *kubeGenericRuntimeManager) GetPortForward(podName, podNamespace string,
 	}
 	return url.Parse(resp.Url)
 }
+
+func (m *kubeGenericRuntimeManager) GetSandboxIDByPodUID(podName string, podNamespace string, podUID kubetypes.UID) ([]string, error) {
+	sandboxIDs, err := m.getSandboxIDByPodUID(podUID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find sandboxID for pod %s: %v", format.PodDesc(podName, podNamespace, podUID), err)
+	}
+	if len(sandboxIDs) == 0 {
+		return nil, fmt.Errorf("failed to find sandboxID for pod %s", format.PodDesc(podName, podNamespace, podUID))
+	}
+	return sandboxIDs, nil
+}

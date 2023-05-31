@@ -421,3 +421,11 @@ func (f *FakeContainerCommandRunner) RunInContainer(containerID kubecontainer.Co
 
 	return []byte(f.Stdout), f.Err
 }
+
+func (f *FakeRuntime) GetSandboxIDByPodUID(podName string, podNamespace string, podUID types.UID) ([]string, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	f.CalledFunctions = append(f.CalledFunctions, "GetSandboxIDByPodUID")
+	return nil, f.Err
+}

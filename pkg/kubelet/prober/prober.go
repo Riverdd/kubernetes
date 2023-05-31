@@ -17,8 +17,13 @@ limitations under the License.
 package prober
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/version"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,9 +33,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
-	kubefeatures "k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
@@ -56,12 +59,14 @@ type prober struct {
 	runner kubecontainer.CommandRunner
 
 	recorder record.EventRecorder
+	runtime kubecontainer.Runtime
 }
 
 // NewProber creates a Prober, it takes a command runner and
 // several container info managers.
 func newProber(
 	runner kubecontainer.CommandRunner,
+	runtime kubecontainer.Runtime,
 	recorder record.EventRecorder) *prober {
 
 	const followNonLocalRedirects = false
@@ -72,6 +77,7 @@ func newProber(
 		grpc:     grpcprobe.New(),
 		runner:   runner,
 		recorder: recorder,
+		runtime: runtime,
 	}
 }
 
@@ -145,55 +151,220 @@ func (pb *prober) runProbeWithRetries(probeType probeType, p *v1.Probe, pod *v1.
 func buildHeader(headerList []v1.HTTPHeader) http.Header {
 	headers := make(http.Header)
 	for _, header := range headerList {
-		headers.Add(header.Name, header.Value)
+		headers[header.Name] = append(headers[header.Name], header.Value)
 	}
 	return headers
 }
 
+type Response struct {
+	Result string `json:"result"`
+	ErrMsg string `json:"errMsg"`
+	Err    string `json:"err"`
+	Body   string `json:"body"`
+}
+
+type RequestBody struct {
+	SandboxID string `json:"sandboxID"`
+	Addr      string `json:"addr"`
+	Timeout   int32  `json:"timeout"`
+	Url       string `json:"url"`
+	Headers   http.Header `json:"headers"`
+	Host      string `json:"host"`
+	Service   string `json:"service"`
+	GRPCPort  int32  `json:"grpcport"`
+}
+
 func (pb *prober) runProbe(probeType probeType, p *v1.Probe, pod *v1.Pod, status v1.PodStatus, container v1.Container, containerID kubecontainer.ContainerID) (probe.Result, string, error) {
 	timeout := time.Duration(p.TimeoutSeconds) * time.Second
+	if pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "kata"{
+		sandboxIDs, _ := pb.runtime.GetSandboxIDByPodUID(pod.Name, pod.Namespace, pod.UID)
+		sandboxID := sandboxIDs[0]
+		if p.TCPSocket != nil {
+			port, err := extractPort(p.TCPSocket.Port, container)
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			host := p.TCPSocket.Host
+			if host == "" {
+				host = status.PodIP
+			}
+			klog.V(4).InfoS("TCP-Probe", "host", host, "port", port, "timeout", timeout)
+			addr := host + ":" + strconv.Itoa(port)
+			body := RequestBody{
+				SandboxID: sandboxID,
+				Addr: addr,
+				Timeout: p.TimeoutSeconds,
+			}
+			agentUrl := "http://127.0.0.1:6666/tcp-probe"
+			jsonBytes, err := json.Marshal(body)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request, err := http.NewRequest("POST", agentUrl, bytes.NewBuffer(jsonBytes))
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request.Header.Set("Content-Type", "application/json")
+			client := http.Client{}
+			response, err := client.Do(request)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			defer response.Body.Close()
+			var resp Response
+			err = json.NewDecoder(response.Body).Decode(&resp)
+			if err != nil {
+				return probe.Failure, "", err
+			}
+			if resp.Result == "success" {
+				return probe.Success, "", nil
+			} else {
+				return probe.Failure, resp.ErrMsg, nil
+			}
+		}
+		if p.HTTPGet != nil {
+			scheme := strings.ToLower(string(p.HTTPGet.Scheme))
+			host := p.HTTPGet.Host
+			if host == "" {
+				host = status.PodIP
+			}
+			port, err := extractPort(p.HTTPGet.Port, container)
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			path := p.HTTPGet.Path
+			klog.V(4).InfoS("HTTP-Probe", "scheme", scheme, "host", host, "port", port, "path", path, "timeout", timeout)
+			url := formatURL(scheme, host, port, path).String()
+			headers := buildHeader(p.HTTPGet.HTTPHeaders)
+			if _, ok := headers["User-Agent"]; !ok {
+				// explicitly set User-Agent so it's not set to default Go value
+				v := version.Get()
+				headers.Set("User-Agent", fmt.Sprintf("kube-probe/%s.%s", v.Major, v.Minor))
+			}
+			if _, ok := headers["Accept"]; !ok {
+				// Accept header was not defined. accept all
+				headers.Set("Accept", "*/*")
+			} else if headers.Get("Accept") == "" {
+				// Accept header was overridden but is empty. removing
+				headers.Del("Accept")
+			}
+			klog.V(4).InfoS("HTTP-Probe Headers", "headers", headers)
+			body := RequestBody{
+				SandboxID: sandboxID,
+				Url: url,
+				Headers: headers,
+				Timeout: p.TimeoutSeconds,
+			}
+			agentUrl := "http://127.0.0.1:6666/http-probe"
+			jsonBytes, err := json.Marshal(body)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request, err := http.NewRequest("POST", agentUrl, bytes.NewBuffer(jsonBytes))
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request.Header.Set("Content-Type", "application/json")
+			client := http.Client{}
+			response, err := client.Do(request)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			defer response.Body.Close()
+			var resp Response
+			err = json.NewDecoder(response.Body).Decode(&resp)
+			if err != nil {
+				return probe.Failure, "", err
+			}
+			if resp.Result == "success" {
+				return probe.Success, "", nil
+			} else {
+				return probe.Failure, resp.Body, nil
+			}
+		}
+		// TODO(wangzihao): Add grpc probe for kata
+		/*
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.GRPCContainerProbe) && p.GRPC != nil {
+			host := &(status.PodIP)
+			service := p.GRPC.Service
+			klog.V(4).InfoS("GRPC-Probe", "host", host, "service", service, "port", p.GRPC.Port, "timeout", timeout)
+			body := RequestBody{
+				SandboxID: sandboxID,
+				Host: *host,
+				//Service: *service,
+				GRPCPort: p.GRPC.Port,
+				Timeout: p.TimeoutSeconds,
+			}
+			agentUrl := "http://127.0.0.1:6666/grpc-probe"
+			jsonBytes, err := json.Marshal(body)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request, err := http.NewRequest("POST", agentUrl, bytes.NewBuffer(jsonBytes))
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			request.Header.Set("Content-Type", "application/json")
+			client := http.Client{}
+			response, err := client.Do(request)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			defer response.Body.Close()
+			var resp Response
+			err = json.NewDecoder(response.Body).Decode(&resp)
+			if err != nil {
+				return probe.Failure, err.Error(), nil
+			}
+			if resp.Result == "success" {
+				return probe.Success, "", nil
+			} else {
+				return probe.Failure, resp.ErrMsg, nil
+			}
+		}
+		*/
+	} else {
+		if p.HTTPGet != nil {
+			scheme := strings.ToLower(string(p.HTTPGet.Scheme))
+			host := p.HTTPGet.Host
+			if host == "" {
+				host = status.PodIP
+			}
+			port, err := extractPort(p.HTTPGet.Port, container)
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			path := p.HTTPGet.Path
+			klog.V(4).InfoS("HTTP-Probe", "scheme", scheme, "host", host, "port", port, "path", path, "timeout", timeout)
+			url := formatURL(scheme, host, port, path)
+			headers := buildHeader(p.HTTPGet.HTTPHeaders)
+			klog.V(4).InfoS("HTTP-Probe Headers", "headers", headers)
+			return pb.http.Probe(url, headers, timeout)
+		}
+		if p.TCPSocket != nil {
+			port, err := extractPort(p.TCPSocket.Port, container)
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			host := p.TCPSocket.Host
+			if host == "" {
+				host = status.PodIP
+			}
+			klog.V(4).InfoS("TCP-Probe", "host", host, "port", port, "timeout", timeout)
+			return pb.tcp.Probe(host, port, timeout)
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.GRPCContainerProbe) && p.GRPC != nil {
+			host := &(status.PodIP)
+			service := p.GRPC.Service
+			klog.V(4).InfoS("GRPC-Probe", "host", host, "service", service, "port", p.GRPC.Port, "timeout", timeout)
+			return pb.grpc.Probe(*host, *service, int(p.GRPC.Port), timeout)
+		}
+	}
 	if p.Exec != nil {
 		klog.V(4).InfoS("Exec-Probe runProbe", "pod", klog.KObj(pod), "containerName", container.Name, "execCommand", p.Exec.Command)
 		command := kubecontainer.ExpandContainerCommandOnlyStatic(p.Exec.Command, container.Env)
 		return pb.exec.Probe(pb.newExecInContainer(container, containerID, command, timeout))
 	}
-	if p.HTTPGet != nil {
-		scheme := strings.ToLower(string(p.HTTPGet.Scheme))
-		host := p.HTTPGet.Host
-		if host == "" {
-			host = status.PodIP
-		}
-		port, err := extractPort(p.HTTPGet.Port, container)
-		if err != nil {
-			return probe.Unknown, "", err
-		}
-		path := p.HTTPGet.Path
-		klog.V(4).InfoS("HTTP-Probe", "scheme", scheme, "host", host, "port", port, "path", path, "timeout", timeout)
-		url := formatURL(scheme, host, port, path)
-		headers := buildHeader(p.HTTPGet.HTTPHeaders)
-		klog.V(4).InfoS("HTTP-Probe Headers", "headers", headers)
-		return pb.http.Probe(url, headers, timeout)
-	}
-	if p.TCPSocket != nil {
-		port, err := extractPort(p.TCPSocket.Port, container)
-		if err != nil {
-			return probe.Unknown, "", err
-		}
-		host := p.TCPSocket.Host
-		if host == "" {
-			host = status.PodIP
-		}
-		klog.V(4).InfoS("TCP-Probe", "host", host, "port", port, "timeout", timeout)
-		return pb.tcp.Probe(host, port, timeout)
-	}
-
-	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.GRPCContainerProbe) && p.GRPC != nil {
-		host := &(status.PodIP)
-		service := p.GRPC.Service
-		klog.V(4).InfoS("GRPC-Probe", "host", host, "service", service, "port", p.GRPC.Port, "timeout", timeout)
-		return pb.grpc.Probe(*host, *service, int(p.GRPC.Port), timeout)
-	}
-
 	klog.InfoS("Failed to find probe builder for container", "containerName", container.Name)
 	return probe.Unknown, "", fmt.Errorf("missing probe handler for %s:%s", format.Pod(pod), container.Name)
 }
